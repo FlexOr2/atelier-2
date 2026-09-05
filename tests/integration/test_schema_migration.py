@@ -543,17 +543,26 @@ def test_published_handoffs_pin_every_predecessor_and_the_current_schema() -> No
         == _PRODUCT_SCHEMA_FINGERPRINT_SHA256[49]
         == "01930b9de9fc8804ed1be5ec34dc02df926373cb95f20319f6e38d92b1c39ea2"
     )
-    # V50 published no handoff of its own: the ledger above is alive only here
-    # (#1168 finding 8), so its fingerprint is pinned without adding to it.
+    # V50 to V52 published no handoff of their own: those fingerprints are
+    # alive only here (#1168 finding 8), so they are pinned without adding to
+    # the handoff list.
     assert (
         _PRODUCT_SCHEMA_FINGERPRINT_SHA256[50]
         == "bb34288b35fbf4fe059960323b7a92ee4e5473b5a945e697c0f4b9fe29c6d8a9"
     )
-    assert PRODUCT_SCHEMA_HANDOFF.version == SCHEMA_VERSION == 51
+    assert (
+        _PRODUCT_SCHEMA_FINGERPRINT_SHA256[51]
+        == "2b0be085b59e160db8b9d925bbb889205b32a2bbd45fcad673277b2b229fd622"
+    )
+    assert (
+        _PRODUCT_SCHEMA_FINGERPRINT_SHA256[52]
+        == "6121453b26de9913e212d726b95d74def93c0a754e25eadfadbe77f7c7c432e2"
+    )
+    assert PRODUCT_SCHEMA_HANDOFF.version == SCHEMA_VERSION == 53
     assert (
         PRODUCT_SCHEMA_HANDOFF.fingerprint_sha256
-        == _PRODUCT_SCHEMA_FINGERPRINT_SHA256[51]
-        == "2b0be085b59e160db8b9d925bbb889205b32a2bbd45fcad673277b2b229fd622"
+        == _PRODUCT_SCHEMA_FINGERPRINT_SHA256[53]
+        == "038b3e7f5ca011d78e6a1013d7b3fde96b8056165106a2c71898e3353e9da881"
     )
 
 
@@ -644,26 +653,34 @@ def _schema_object_names(connection: sqlite3.Connection) -> frozenset[str]:
     )
 
 
-_REPUBLISHED_BY_A_LATER_HOP = "agent_attempts"
-"""The table a hop after the one under test republishes for reasons of its own.
+_REPUBLISHED_BY_A_LATER_HOP = (
+    "agent_attempts",
+    "queue_project_policy_revisions",
+    "queue_proposal_revisions",
+)
+"""The tables a hop after the one under test republishes for reasons of its own.
 
 A store migrated to today crosses every remaining hop, not only the one a test
-is about, and V50 rebuilds this table to widen its failure-code vocabulary. Its
-declaration is therefore expected to differ afterwards; every row in it, and
-every other statement, is not.
+is about: V50 and V53 rebuild the attempt table to widen its failure-code
+vocabulary, and V52 gives the queue policy its proposal defaults and every
+proposal the source that wrote it. Their declarations are therefore expected to
+differ afterwards; every row in them, and every other statement, is not.
 """
 
 
 def _rows_beside_the_version_owner(connection: sqlite3.Connection) -> frozenset[str]:
     """Every dumped statement except the ones a hop is expected to change."""
 
+    republished = tuple(
+        prefix
+        for name in _REPUBLISHED_BY_A_LATER_HOP
+        for prefix in (f"CREATE TABLE {name} (", f"CREATE TRIGGER {name}_")
+    )
     return frozenset(
         statement
         for statement in connection.iterdump()
         if "atelier_schema_versions" not in statement
-        and not (
-            statement.startswith("CREATE") and _REPUBLISHED_BY_A_LATER_HOP in statement
-        )
+        and not statement.startswith(republished)
     )
 
 

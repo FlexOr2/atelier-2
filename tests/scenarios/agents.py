@@ -37,7 +37,6 @@ from atelier2.contracts.agent_attempts import (
     AgentAttemptFailureCode,
     AgentAttemptId,
     AgentAttemptState,
-    ProcessExitSignature,
 )
 from atelier2.contracts.agent_permissions import (
     GRANTS_NOTHING,
@@ -84,6 +83,7 @@ from atelier2.contracts.host_configuration import (
     ModelRegistryRevision,
     ProviderModelCheck,
 )
+from atelier2.contracts.process_endings import ProcessExitSignature
 from atelier2.contracts.run_bindings import RunV3
 from atelier2.contracts.runs import RunId, WorkflowRevision, WorkflowRevisionHash
 from atelier2.ports.agent_executions import (
@@ -95,6 +95,9 @@ from atelier2.ports.agent_executions import (
     AgentProcessInvocation,
     AgentSession,
     PermissionDecider,
+    PrintModeExecutor,
+    ProviderCancellationCause,
+    ProviderConversationBinding,
 )
 from atelier2.ports.durable_runs import (
     DurablePublishedRunResult,
@@ -251,6 +254,7 @@ def process_invocation(
     standard_input: bytes = b"",
     *,
     standard_output_frame_bytes: int = SCENARIO_PROVIDER_FRAME_BYTES,
+    conversation: ProviderConversationBinding | None = None,
 ) -> AgentProcessInvocation:
     """One invocation for a test that supervises a process it houses itself.
 
@@ -267,6 +271,7 @@ def process_invocation(
             standard_output_frame_bytes=standard_output_frame_bytes,
         ),
         leased_directory_identity(attempt_id, working_directory),
+        conversation,
     )
 
 
@@ -768,7 +773,7 @@ def answering(
 
 
 @dataclass
-class RecordingAgentExecutorV2:
+class RecordingAgentExecutorV2(PrintModeExecutor):
     output: bytes = b""
     requests: list[AgentExecutionRequestV2] = field(default_factory=list)
     lifecycle: list[str] = field(default_factory=list)
@@ -939,8 +944,12 @@ class FakeAgentSession(AgentSession):
             )
         return self.completion
 
-    def cancel(self, attempt: AgentAttempt) -> Never:
-        del attempt
+    def cancel(
+        self,
+        attempt: AgentAttempt,
+        cause: ProviderCancellationCause = ProviderCancellationCause.OPERATOR,
+    ) -> Never:
+        del attempt, cause
         raise NotImplementedError(_NO_FAKED_SUPERVISION)
 
     def recover(self, attempt: AgentAttempt) -> Never:

@@ -17,19 +17,46 @@ Read as data by the gate; never imported at runtime.
 WAITING_FOR_A_CALLER = (
     {
         "names": (
-            "adapters/docker_carrier.py:attest_runner_inspect",
-            "adapters/free_runner_executor.py:encode_free_runner_job",
-            "contracts/runner_session_codec.py:MAXIMUM_RUNNER_SESSION_WIRE_FRAME_BYTES",
-            "contracts/runner_terminal_evidence_codec.py:refused_exchange",
+            "ports/agent_executions.py:READ",
+            "ports/agent_executions.py:ENDED",
+            "ports/agent_executions.py:POLICY_REFUSED",
+            "ports/agent_executions.py:BUDGET_EXHAUSTED",
+            "ports/agent_executions.py:terminal_outcome",
         ),
         "why": (
-            "The Agent Runner cluster (runner/, adapters/free_runner_executor.py, "
-            "adapters/runner_child.py, adapters/docker_carrier.py): the candidate "
-            "issuer, its job encoder and the session codec's bounds are exercised "
-            "by tests/witness and the codec tests, and wait for the placement of "
-            "the Runner in the serving host."
+            "The duplex conversation seam (ADR 0020 step 2, slice 2-B): the "
+            "supervisor relays file requests, cancellation causes and the typed "
+            "terminal outcome a conversation composes, but every executor this "
+            "product runs still answers in print mode, so no production site "
+            "reads a file effect, a terminal reason or the completion's outcome "
+            "until the first speaking provider arrives."
         ),
-        "item": "#1177 (Runner-Platzierung offen)",
+        "item": "#1177 Schritt 2 (2-C ACP-Client, 2-D Grok-Executor)",
+    },
+    {
+        "names": (
+            "adapters/runner_child.py:start_runner_child",
+            "adapters/runner_child.py:reap_cancelled_runner_child",
+            "adapters/runner_child.py:landlock_kernel_abi",
+        ),
+        "why": (
+            "The one runner-cluster module #1252 kept: #1177 Schritt 0 already "
+            "names `start_runner_child` as the subprocess primitive the future "
+            "AgentSession duplex driver spawns a provider child through, and "
+            "the cancel/landlock-ABI helpers beside it serve the same seam. "
+            "Every other caller was the frozen Agent Runner deleted with #1252."
+        ),
+        "item": "#1177 Schritt 2 (2-B/2-C duplex driver)",
+    },
+    {
+        "names": ("contracts/agents.py:AuthReference",),
+        "why": (
+            "#1177 F names this exact shape as the Runner's future credential "
+            'reference ("eine logische Referenz (AuthReference)"); its one '
+            "production constructor, the fake-free candidate, was deleted with "
+            "#1252 and no other provider builds one yet."
+        ),
+        "item": "#1177 Schritt 2/F (Credential-Referenz)",
     },
     {
         "names": (
@@ -89,12 +116,14 @@ WAITING_FOR_A_CALLER = (
             "contracts/run_bindings.py:AnyBoundRun",
             "contracts/node_records_v3.py:MAXIMUM_KIND_TOKEN_CHARACTERS",
             "contracts/catalog_v3.py:derived",
+            "contracts/catalog_v3.py:claimed",
         ),
         "why": (
             "Contract helpers a caller was planned for and has not arrived at: the "
             "scheduler that applies a join, the reader that reports which lineage "
-            "id was derived, the bound-run alias and the kind token bound. Each "
-            "is proven by a domain test and named by an ADR."
+            "id was claimed and which was derived, the bound-run alias and the "
+            "kind token bound. Each is proven by a domain test and named by an "
+            "ADR."
         ),
         "item": "#1168 Befund 7 (test-only-lebendig, Owner beim Dispatch)",
     },
@@ -112,6 +141,7 @@ WAITING_FOR_A_CALLER = (
     {
         "names": (
             "contracts/agent_permissions.py:WORKSPACE_READ",
+            "contracts/agent_permissions.py:WORKSPACE_WRITE",
             "contracts/agent_permissions.py:COMMAND",
             "contracts/agent_permissions.py:NETWORK",
             "contracts/agent_permissions.py:SECRET_READ",

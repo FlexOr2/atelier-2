@@ -5,9 +5,10 @@ build-backend = "hatchling.build"
 [project]
 name = "atelier-2"
 version = "0.0.0"
+license = "MIT"
+classifiers = ["License :: OSI Approved :: MIT License"]
 requires-python = "==3.12.13"
 dependencies = [
-    "cryptography==50.0.0",
     "dbos==2.29.0",
     "fastapi==0.141.1",
     "githubkit==0.16.1",
@@ -21,9 +22,6 @@ dependencies = [
 
 [project.scripts]
 atelier2 = "atelier2.host:main"
-atelier2-runner-launcher = "atelier2.host.runner_launcher:main"
-atelier2-runner = "atelier2.runner:main"
-atelier2-runner-identity-receiver = "atelier2.runner.identity_receiver:main"
 
 [dependency-groups]
 dev = [
@@ -45,7 +43,8 @@ dev = [
 # pins the checkout into the attempt's own workspace before this runs, so the
 # tree it needs is already there.
 #
-# `tests/crash` is excluded on purpose (#1152): the pipeline's own quality job
+# `tests/crash` is excluded on purpose (#1152): the pipeline's own Python test
+# job
 # (.github/workflows/ci.yml) never bundles it with the rest either -- it runs
 # alone, in the `crash-recovery` job, inside a systemd scope with cgroup
 # delegation (`Delegate=yes`, `KillMode=control-group`) that a grant's
@@ -92,7 +91,7 @@ type = "layers"
 containers = ["atelier2"]
 layers = [
     "__main__",
-    "host | runner",
+    "host",
     "api | adapters",
     "application",
     "ports",

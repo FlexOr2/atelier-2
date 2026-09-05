@@ -42,6 +42,7 @@ from atelier2.contracts.agent_attempts import (
 from atelier2.contracts.agent_permissions import GRANTS_NOTHING
 from atelier2.contracts.agents import AgentExecutionRequestV2, AgentExecutionResult
 from atelier2.contracts.artifacts import Artifact
+from atelier2.contracts.candidate_reports import ReadPatch
 from atelier2.contracts.executions import AgentAttemptExecution, RunEventKind
 from atelier2.contracts.project_sources import CandidateTree, ProjectSourcePin
 from atelier2.contracts.tool_grants_v3 import (
@@ -59,6 +60,7 @@ from atelier2.ports.agent_executions import (
     AgentProcessCommand,
     AgentProcessCompletion,
     AgentProcessInvocation,
+    PrintModeExecutor,
 )
 from atelier2.ports.artifacts import ArtifactPublisher, PublishArtifactResult
 from atelier2.ports.candidate_store import (
@@ -100,7 +102,7 @@ def writing(name: str, text: str) -> list[str]:
 
 
 @dataclass
-class WorkingExecutor:
+class WorkingExecutor(PrintModeExecutor):
     """A provider of no particular vendor that leaves its work in the lease."""
 
     def prepare_process(self, request: AgentExecutionRequestV2) -> AgentProcessCommand:
@@ -163,7 +165,7 @@ class LostUnderTheCapture:
     ) -> LeasedWorkingTree:
         return self.kept.written(pin, lease)
 
-    def changes(self, written: LeasedWorkingTree) -> bytes:
+    def changes(self, written: LeasedWorkingTree) -> ReadPatch:
         return self.kept.changes(written)
 
 
@@ -195,7 +197,7 @@ class RefusingCandidates:
         self.asked.append(lease.attempt_id)
         raise self.refusal
 
-    def changes(self, written: LeasedWorkingTree) -> bytes:
+    def changes(self, written: LeasedWorkingTree) -> ReadPatch:
         raise AssertionError(written)
 
 

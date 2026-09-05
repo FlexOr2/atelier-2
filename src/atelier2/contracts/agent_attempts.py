@@ -4,16 +4,9 @@ import struct
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from atelier2.contracts.agent_transcripts import (
-    AttemptTranscript,
-    ProviderTerminalRefusal,
-)
 from atelier2.contracts.agents import (
     MAXIMUM_AGENT_FIELD_CHARACTERS,
-    MAXIMUM_AGENT_OUTPUT_BYTES_V2,
-    MAXIMUM_SIGNED_INT64,
     AgentExecutionRequestHash,
-    AgentExecutionResult,
     AgentExecutorOperationalIdentity,
     AgentReceiptHash,
 )
@@ -22,7 +15,6 @@ from atelier2.contracts.executions import NodeExecutionId
 from atelier2.contracts.hashing import Sha256Hash, frame
 from atelier2.contracts.revisions_v3 import PublishedRevisionHash
 from atelier2.contracts.runs import RunId, WorkflowRevisionHash
-from atelier2.contracts.secret_redaction import redact_credentials
 
 AGENT_ATTEMPT_ORDINAL = 1
 REPLACEMENT_AGENT_ATTEMPT_ORDINAL = 2
@@ -154,146 +146,14 @@ class AgentAttemptFailureCode(StrEnum):
     # Naming it is what lets such an attempt end in seconds instead of paying a
     # whole project verification to discover that it verified the pin (#1156).
     CANDIDATE_UNCHANGED = "CANDIDATE_UNCHANGED"
-
-
-MAXIMUM_RECEIPTED_STANDARD_ERROR_BYTES = 2_048
-"""How much of a dead process's standard error one durable receipt keeps.
-
-Supervision already bounds how much a child may say at all; this is the far
-smaller bound of how much of it becomes a *receipt*, because a receipt is a
-sentence an operator reads at a glance, not a log. One owner for the number, so
-no writer of a receipt picks its own.
-"""
-
-
-MAXIMUM_RECEIPTED_AGENT_ANSWER_BYTES = 2_048
-"""How much of what a provider answered one durable receipt keeps as words.
-
-Sibling to `MAXIMUM_RECEIPTED_STANDARD_ERROR_BYTES`, and the same width for the
-same reason: a receipt is a sentence an operator reads at a glance. Kept from
-the *start* of the answer rather than its end, because an answer is a document
-whose opening fields are the ones a reader came for -- a tail would cut off the
-beginning of the very summary it exists to show.
-"""
-
-
-def _readable(said: bytes) -> str:
-    """Provider bytes as text a receipt may hold and a terminal may print.
-
-    A tail is cut at a byte boundary, so a character the cut split is replaced
-    rather than raised over. Control characters are replaced for a second
-    reason: a provider that writes terminal escape sequences to standard error
-    would otherwise move the cursor of every operator who prints this reason.
-    """
-    return "".join(
-        character if character.isprintable() or character in "\n\t" else "\ufffd"
-        for character in said.decode("utf-8", "replace")
-    )
-
-
-@dataclass(frozen=True)
-class ProcessExitSignature:
-    """How one provider process ended, in the words its receipt keeps.
-
-    `return_code` follows the convention the process runner reports it under: a
-    negative value is the signal that killed the child. Zero is not a
-    contradiction beside `PROCESS_EXITED_UNSUCCESSFULLY` -- an executor reaches
-    that code just as well for a child that exited cleanly and left an answer
-    the provider's own wire format cannot carry -- so the named verdict says
-    which of the three happened instead of implying an exit that never did.
-
-    Standard error travels here and nowhere else: it is the only place the
-    reason a process died is written down, and it is deliberately not on the
-    event stream, which stays the bounded, secret-free surface it is.
-    """
-
-    return_code: int
-    standard_error: bytes
-
-    def __post_init__(self) -> None:
-        if type(self.return_code) is not int:
-            raise TypeError("a process exit signature names an integer return code")
-        if type(self.standard_error) is not bytes:
-            raise TypeError("a process exit signature carries standard error bytes")
-
-    def named(self) -> str:
-        """The one sentence a receipt keeps about this exit."""
-        return f"{self._ended}; {self._said}"
-
-    @property
-    def _ended(self) -> str:
-        if self.return_code < 0:
-            return f"killed by signal {-self.return_code}"
-        if self.return_code > 0:
-            return f"exited with code {self.return_code}"
-        return "exited with code 0 leaving an answer its executor could not read"
-
-    @property
-    def _said(self) -> str:
-        if not self.standard_error:
-            return "it wrote nothing to standard error"
-        tail = _readable(self.standard_error[-MAXIMUM_RECEIPTED_STANDARD_ERROR_BYTES:])
-        if len(self.standard_error) <= MAXIMUM_RECEIPTED_STANDARD_ERROR_BYTES:
-            return f"standard error: {tail}"
-        return (
-            f"last {MAXIMUM_RECEIPTED_STANDARD_ERROR_BYTES} of "
-            f"{len(self.standard_error)} standard error bytes: {tail}"
-        )
-
-
-def receipted_agent_answer(answer: bytes) -> str:
-    """What the provider answered, in the bounded words a receipt may keep.
-
-    Redacted before it is kept, unlike the transcript this answer travels
-    beside: a receipt reason is durable material an operator reads and the run
-    page shows, so a credential a provider echoed out of its own tooling must
-    not survive into it.
-    """
-
-    if not answer:
-        return "nothing"
-    head = redact_credentials(
-        _readable(answer[:MAXIMUM_RECEIPTED_AGENT_ANSWER_BYTES])
-    ).text
-    if len(answer) <= MAXIMUM_RECEIPTED_AGENT_ANSWER_BYTES:
-        return head
-    return (
-        f"first {MAXIMUM_RECEIPTED_AGENT_ANSWER_BYTES} of {len(answer)} "
-        f"answer bytes: {head}"
-    )
-
-
-def process_exit_verdict(
-    exit_signature: ProcessExitSignature, transcript: AttemptTranscript | None
-) -> str:
-    """The one sentence a receipt keeps about a failed process, honestly sourced.
-
-    An exit code and an empty standard error explain nothing about a call the
-    provider itself read and refused before it did anything (`#1029`, `#942`):
-    the process behaved exactly as designed, and the shell around it is not
-    where that refusal was said. Where the transcript carries the provider's
-    own named refusal, the receipt keeps that instead of the exit signature's
-    silence; every other ending -- a crash, a timeout, a supervision failure --
-    still gets the exit signature's own words, unchanged. Any provider's
-    transcript may carry the refusal step, not only Claude's: the vocabulary is
-    neutral even though one adapter is the only writer of it today.
-    """
-
-    refusal = _terminal_refusal(transcript)
-    if refusal is None:
-        return exit_signature.named()
-    return f"provider-reported: {refusal.terminal_reason}: {refusal.text}"
-
-
-def _terminal_refusal(
-    transcript: AttemptTranscript | None,
-) -> ProviderTerminalRefusal | None:
-    if transcript is None:
-        return None
-    for event in transcript.events:
-        if isinstance(event, ProviderTerminalRefusal):
-            return event
-    return None
+    # The provider's own bytes were admitted, and the value this execution
+    # composed around them -- that answer with the atelier's patch of the kept
+    # tree written in -- is what this node's schema refuses, or what no longer
+    # fits one produced value. Distinct from `OUTPUT_SCHEMA_REFUSED` because the
+    # refused bytes have another author: that code would put an agent's name on
+    # text the atelier wrote, and would order a repair round asking a provider
+    # to answer differently about something it never wrote.
+    PRODUCED_VALUE_REFUSED = "PRODUCED_VALUE_REFUSED"
 
 
 class AgentAttemptReplacement(StrEnum):
@@ -319,10 +179,6 @@ class AgentAttemptCancellationDisposition(StrEnum):
     REAPED_AFTER_TERM = "REAPED_AFTER_TERM"
     REAPED_AFTER_KILL = "REAPED_AFTER_KILL"
     OWNER_LOST_AFTER_PARENT_DEATH = "OWNER_LOST_AFTER_PARENT_DEATH"
-
-
-class RunnerBindingConflict(RuntimeError):
-    """A generation, invocation, or evidence delivery contradicts its binding."""
 
 
 class RunnerManifestId(Sha256Hash):
@@ -369,168 +225,11 @@ class RunnerInvocationId:
         _require_runner_identity(self.value, "runner invocation id")
 
 
-@dataclass(frozen=True)
-class RunnerGenerationBinding:
-    """The immutable work and Runner offer bound to one Core generation."""
-
-    attempt_id: AgentAttemptId
-    request_hash: AgentExecutionRequestHash
-    generation_id: RunnerGenerationId
-    manifest_id: RunnerManifestId
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.attempt_id, AgentAttemptId):
-            raise TypeError("runner generation binding requires a typed attempt id")
-        if not isinstance(self.request_hash, AgentExecutionRequestHash):
-            raise TypeError("runner generation binding requires a typed request hash")
-        if not isinstance(self.generation_id, RunnerGenerationId):
-            raise TypeError("runner generation binding requires a typed generation id")
-        if not isinstance(self.manifest_id, RunnerManifestId):
-            raise TypeError("runner generation binding requires a typed manifest id")
-
-
-class RunnerOutputStream(StrEnum):
-    STANDARD_OUTPUT = "STANDARD_OUTPUT"
-    STANDARD_ERROR = "STANDARD_ERROR"
-
-
 class RunnerCancellationObservation(StrEnum):
     NEVER_LAUNCHED = "NEVER_LAUNCHED"
     EXITED_BEFORE_SIGNAL = "EXITED_BEFORE_SIGNAL"
     REAPED_AFTER_TERM = "REAPED_AFTER_TERM"
     REAPED_AFTER_KILL = "REAPED_AFTER_KILL"
-
-
-class RunnerEvidenceCannotCarryTranscript(ValueError):
-    """The deferred session integration cannot yet translate a failure transcript.
-
-    Exchange V2 carries transcripts. This refusal remains only for the old
-    session composition, whose integration is outside this contract slice.
-    """
-
-
-@dataclass(frozen=True)
-class RunnerProviderResult:
-    """One provider answer already decoded into the durable result contract."""
-
-    result: AgentExecutionResult
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.result, AgentExecutionResult):
-            raise TypeError(
-                "runner provider result requires a decoded agent execution result"
-            )
-        if type(self.result.output_bytes) is not bytes:
-            raise TypeError("runner provider result requires exact output bytes")
-        if len(self.result.output_bytes) > MAXIMUM_AGENT_OUTPUT_BYTES_V2:
-            raise ValueError("runner provider result exceeds the durable output bound")
-        if self.result.transcript is not None and not isinstance(
-            self.result.transcript, AttemptTranscript
-        ):
-            raise TypeError("runner provider result requires a typed transcript")
-
-
-@dataclass(frozen=True)
-class RunnerProviderFailure:
-    """One admitted decoded failure with its physical process evidence."""
-
-    exit_signature: ProcessExitSignature
-    failure_code: AgentAttemptFailureCode = (
-        AgentAttemptFailureCode.PROCESS_EXITED_UNSUCCESSFULLY
-    )
-    transcript: AttemptTranscript | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.exit_signature, ProcessExitSignature):
-            raise TypeError("runner provider failure requires a process exit signature")
-        if not (
-            -MAXIMUM_SIGNED_INT64 - 1
-            <= self.exit_signature.return_code
-            <= MAXIMUM_SIGNED_INT64
-        ):
-            raise ValueError(
-                "runner provider failure return code must fit signed int64"
-            )
-        if (
-            len(self.exit_signature.standard_error)
-            > MAXIMUM_RUNNER_STANDARD_ERROR_BYTES
-        ):
-            raise ValueError(
-                "runner provider failure standard error evidence is too large"
-            )
-        if not isinstance(self.failure_code, AgentAttemptFailureCode):
-            raise TypeError("runner provider failure requires a typed failure code")
-        if self.failure_code not in {
-            AgentAttemptFailureCode.AGENT_REFUSED,
-            AgentAttemptFailureCode.PROCESS_EXITED_UNSUCCESSFULLY,
-        }:
-            raise ValueError(
-                "runner provider failure requires an admitted failure code"
-            )
-        if self.transcript is not None and not isinstance(
-            self.transcript, AttemptTranscript
-        ):
-            raise TypeError("runner provider failure requires a typed transcript")
-
-
-@dataclass(frozen=True)
-class RunnerOutputLimitExceeded:
-    """Which process streams crossed their separately enforced collection bounds."""
-
-    exceeded_streams: frozenset[RunnerOutputStream]
-
-    def __post_init__(self) -> None:
-        if type(self.exceeded_streams) is not frozenset:
-            raise TypeError("runner output-limit streams must be a frozen set")
-        if not self.exceeded_streams:
-            raise ValueError("runner output-limit streams must be nonempty")
-        if not all(
-            isinstance(stream, RunnerOutputStream) for stream in self.exceeded_streams
-        ):
-            raise TypeError(
-                "runner output-limit streams must use the closed stream type"
-            )
-
-
-@dataclass(frozen=True)
-class RunnerProcessBoundaryFailure:
-    """The process boundary failed without a provider ending to report."""
-
-
-@dataclass(frozen=True)
-class RunnerCancellation:
-    """The physical observation made while carrying out one cancellation command."""
-
-    command_id: str
-    observation: RunnerCancellationObservation
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.command_id, str)
-            or not 1 <= len(self.command_id) <= MAXIMUM_AGENT_FIELD_CHARACTERS
-        ):
-            raise ValueError(
-                "runner cancellation command id must contain "
-                f"1..{MAXIMUM_AGENT_FIELD_CHARACTERS} characters"
-            )
-        _require_runner_text(self.command_id, "runner cancellation command id")
-        if not isinstance(self.observation, RunnerCancellationObservation):
-            raise TypeError("runner cancellation requires a typed physical observation")
-
-
-@dataclass(frozen=True)
-class RunnerInvocationLost:
-    """Positive authoritative evidence that the exact invocation was lost."""
-
-
-type RunnerTerminalEvidence = (
-    RunnerProviderResult
-    | RunnerProviderFailure
-    | RunnerOutputLimitExceeded
-    | RunnerProcessBoundaryFailure
-    | RunnerCancellation
-    | RunnerInvocationLost
-)
 
 
 class RunnerEvidenceAcceptancePhase(StrEnum):
@@ -541,146 +240,9 @@ class RunnerEvidenceAcceptancePhase(StrEnum):
     ACKNOWLEDGED = "ACKNOWLEDGED"
 
 
-@dataclass(frozen=True)
-class RunnerTerminalEvidenceEnvelope:
-    """Terminal evidence bound to the exact generation and accepted invocation."""
-
-    binding: RunnerGenerationBinding
-    invocation_id: RunnerInvocationId | None
-    evidence: RunnerTerminalEvidence
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.binding, RunnerGenerationBinding):
-            raise TypeError("runner terminal evidence requires a typed binding")
-        if self.invocation_id is not None and not isinstance(
-            self.invocation_id, RunnerInvocationId
-        ):
-            raise TypeError("runner terminal evidence requires a typed invocation id")
-        if not isinstance(
-            self.evidence,
-            (
-                RunnerProviderResult,
-                RunnerProviderFailure,
-                RunnerOutputLimitExceeded,
-                RunnerProcessBoundaryFailure,
-                RunnerCancellation,
-                RunnerInvocationLost,
-            ),
-        ):
-            raise TypeError(
-                "runner terminal evidence requires a closed terminal evidence"
-            )
-        authoritative_no_launch = (
-            isinstance(self.evidence, RunnerCancellation)
-            and self.evidence.observation
-            is RunnerCancellationObservation.NEVER_LAUNCHED
-        )
-        if self.invocation_id is None and not authoritative_no_launch:
-            raise ValueError(
-                "runner terminal evidence without an invocation must prove never launched"
-            )
-
-
 class RunnerTerminalEvidenceHash(Sha256Hash):
-    """Semantic identity of one typed Runner evidence envelope.
-
-    The hash deliberately owns the domain envelope, not a Runner transport codec:
-    a later codec may change representation without changing whether Core has
-    already accepted the same fact.
-    """
-
-    @classmethod
-    def for_envelope(
-        cls, envelope: RunnerTerminalEvidenceEnvelope
-    ) -> RunnerTerminalEvidenceHash:
-        evidence = envelope.evidence
-        match evidence:
-            case RunnerProviderResult(result):
-                variant = "provider-result"
-                transcript_presence, transcript_document = _runner_transcript_payload(
-                    result.transcript
-                )
-                payload = (
-                    result.output_bytes,
-                    transcript_presence,
-                    transcript_document,
-                )
-            case RunnerProviderFailure(exit_signature, failure_code, transcript):
-                variant = "provider-failure"
-                transcript_presence, transcript_document = _runner_transcript_payload(
-                    transcript
-                )
-                payload = (
-                    failure_code.value.encode("ascii"),
-                    struct.pack(">q", exit_signature.return_code),
-                    exit_signature.standard_error,
-                    transcript_presence,
-                    transcript_document,
-                )
-            case RunnerOutputLimitExceeded(exceeded_streams):
-                variant = "output-limit-exceeded"
-                payload = tuple(
-                    stream.value.encode("ascii")
-                    for stream in sorted(exceeded_streams, key=lambda item: item.value)
-                )
-            case RunnerProcessBoundaryFailure():
-                variant = "process-boundary-failure"
-                payload = ()
-            case RunnerCancellation(command_id, observation):
-                variant = "cancellation"
-                payload = (
-                    command_id.encode("utf-8"),
-                    observation.value.encode("ascii"),
-                )
-            case RunnerInvocationLost():
-                variant = "invocation-lost"
-                payload = ()
-        binding = envelope.binding
-        invocation = envelope.invocation_id
-        return cls.of(
-            frame(
-                "runner-terminal-evidence/v2",
-                binding.attempt_id.value.encode("ascii"),
-                binding.request_hash.value.encode("ascii"),
-                binding.generation_id.value.encode("utf-8"),
-                binding.manifest_id.value.encode("ascii"),
-                b"" if invocation is None else invocation.value.encode("utf-8"),
-                variant.encode("ascii"),
-                *payload,
-            )
-        )
-
-
-def _runner_transcript_payload(
-    transcript: AttemptTranscript | None,
-) -> tuple[bytes, bytes]:
-    if transcript is None:
-        return b"absent", b""
-    return b"present", transcript.document
-
-
-@dataclass(frozen=True)
-class RunnerTerminalEvidenceAckTombstone:
-    """Runner proof that exact terminal evidence was acknowledged and collected."""
-
-    binding: RunnerGenerationBinding
-    invocation_id: RunnerInvocationId | None
-    evidence_hash: RunnerTerminalEvidenceHash
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.binding, RunnerGenerationBinding):
-            raise TypeError("runner evidence ACK requires a typed binding")
-        if self.invocation_id is not None and not isinstance(
-            self.invocation_id, RunnerInvocationId
-        ):
-            raise TypeError("runner evidence ACK requires a typed invocation id")
-        if not isinstance(self.evidence_hash, RunnerTerminalEvidenceHash):
-            raise TypeError("runner evidence ACK requires a typed evidence hash")
-
-
-type RunnerTerminalEvidenceReadback = (
-    RunnerTerminalEvidenceEnvelope | RunnerTerminalEvidenceAckTombstone
-)
+    """Semantic identity of one Runner evidence object, kept for the durable
+    `runner_terminal_evidence_hash` column an attempt may already carry."""
 
 
 class AgentAttemptProcessPhase(StrEnum):

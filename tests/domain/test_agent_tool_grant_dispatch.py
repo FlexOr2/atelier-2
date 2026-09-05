@@ -75,6 +75,7 @@ from atelier2.ports.agent_executions import (
     AgentProcessCompletion,
     AgentProcessInvocation,
     PermissionDecider,
+    PrintModeExecutor,
 )
 from atelier2.ports.agent_tool_effects import (
     AgentToolEffectDelivered,
@@ -151,9 +152,13 @@ class _ClaimingStore:
         return AgentAttemptClaimedByThisCall(self.attempt)
 
     def complete_success(
-        self, execution: object, result: object, redemption: object
+        self,
+        execution: object,
+        result: object,
+        redemption: object,
+        candidate_diff: str | None = None,
     ) -> AgentAttemptSucceeded:
-        del execution, result
+        del execution, result, candidate_diff
         self.completed += 1
         self.redemption = redemption
         assert self.attempt is not None
@@ -161,7 +166,7 @@ class _ClaimingStore:
 
 
 @dataclass
-class _SucceedingExecutor:
+class _SucceedingExecutor(PrintModeExecutor):
     """A provider that answers; what redeems its work is the subject."""
 
     def prepare_process(self, request: object) -> AgentProcessCommand:

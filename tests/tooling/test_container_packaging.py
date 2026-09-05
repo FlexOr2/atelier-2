@@ -15,7 +15,11 @@ from typing import Any
 import pytest
 import yaml
 
-from tests.tooling.container_test_support import wait_for_exit, wait_until_exists
+from tests.tooling.container_test_support import (
+    started_process,
+    wait_for_exit,
+    wait_until_exists,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = PROJECT_ROOT / "Dockerfile"
@@ -32,14 +36,6 @@ CI = PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
 
 SOURCE_COMMIT = "ATELIER2_SOURCE_COMMIT"
 SOURCE_TREE = "ATELIER2_SOURCE_TREE"
-RUNNER_LEASE_CARRIERS = {
-    "ATELIER2_RUNNER_LEASE_ROOT": "--runner-lease-root",
-    "ATELIER2_RUNNER_IMAGE": "--runner-image",
-    "ATELIER2_RUNNER_IMAGE_DIGEST": "--runner-image-digest",
-    "ATELIER2_RUNNER_CONSOLE_CONTAINER": "--runner-console-container",
-    "ATELIER2_RUNNER_CORE_IDENTITY_DIRECTORY": "--runner-core-identity-directory",
-    "ATELIER2_RUNNER_ACCEPT_TIMEOUT_SECONDS": "--runner-accept-timeout-seconds",
-}
 DIRTY_TREE_REFUSAL = "container snapshot: source tree must be clean"
 PROJECT_NAME = re.compile(r"^atelier2-[0-9a-f]{16}$")
 
@@ -171,7 +167,7 @@ def assert_python_carrier_configuration(
     assert f'requires-python = "=={PYTHON_VERSION}"' in project
     assert f'requires-python = "=={PYTHON_VERSION}"' in lock
     configured_versions = _CI_PYTHON_VERSION.findall(workflow)
-    assert configured_versions == [PYTHON_VERSION] * 4
+    assert configured_versions == [PYTHON_VERSION] * 5
 
 
 def assert_isolated_compose(document: dict[str, Any]) -> None:
@@ -783,46 +779,6 @@ def test_serve_has_no_provider_or_credential_vector() -> None:
         assert forbidden not in serve.lower()
 
 
-def test_undeclared_runner_lease_deployment_serves_runner_free(tmp_path: Path) -> None:
-    arguments = packaged_serve_arguments(tmp_path)
-    assert arguments[0] == "serve"
-    assert not any(argument.startswith("--runner") for argument in arguments)
-
-
-def test_serve_carries_every_declared_runner_lease_value_unchanged(
-    tmp_path: Path,
-) -> None:
-    declared = {
-        "ATELIER2_RUNNER_LEASE_ROOT": "/srv/atelier2/runner lease root",
-        "ATELIER2_RUNNER_IMAGE": "atelier2-runner:candidate",
-        "ATELIER2_RUNNER_IMAGE_DIGEST": f"sha256:{'a' * 64}",
-        "ATELIER2_RUNNER_CONSOLE_CONTAINER": "atelier2-console",
-        "ATELIER2_RUNNER_CORE_IDENTITY_DIRECTORY": "/srv/atelier2/console-identity",
-        "ATELIER2_RUNNER_ACCEPT_TIMEOUT_SECONDS": "30.0",
-    }
-
-    baseline = packaged_serve_arguments(tmp_path)
-    carried = packaged_serve_arguments(tmp_path, declared)
-
-    assert carried == baseline + [
-        token
-        for name, flag in RUNNER_LEASE_CARRIERS.items()
-        for token in (flag, declared[name])
-    ]
-
-
-def test_serve_carries_a_partial_runner_lease_declaration_for_serve_to_refuse(
-    tmp_path: Path,
-) -> None:
-    baseline = packaged_serve_arguments(tmp_path)
-
-    carried = packaged_serve_arguments(
-        tmp_path, {"ATELIER2_RUNNER_IMAGE": "atelier2-runner:candidate"}
-    )
-
-    assert carried == baseline + ["--runner-image", "atelier2-runner:candidate"]
-
-
 def test_clean_tree_starts_one_random_project_and_prints_scoped_teardown(
     tmp_path: Path,
 ) -> None:
@@ -1146,27 +1102,30 @@ def _signals_preserve_first_status_and_teardown_exact_project(
     repository = packaging_repository(tmp_path)
     wait_phases = (phase, "down") if second_signal is not None else (phase,)
     environment = container_environment(repository, tmp_path, wait_phases=wait_phases)
-    process = subprocess.Popen(
+    with started_process(
         _with_default_interruption_signals(
             ["bash", str(repository / "scripts" / "container_up.sh")]
         ),
         cwd=repository,
         env=environment,
-        start_new_session=True,
-    )
-    ready = tmp_path / f"{phase}-ready"
-    wait_until_exists(ready, process, "Docker stub did not reach the launch boundary")
-    os.killpg(process.pid, first_signal)
-    if second_signal is not None:
+    ) as process:
+        ready = tmp_path / f"{phase}-ready"
         wait_until_exists(
-            tmp_path / "down-ready", process, "Docker stub did not reach cleanup"
+            ready, process, "Docker stub did not reach the launch boundary"
         )
-        os.killpg(process.pid, second_signal)
-        (tmp_path / "docker-down-release").touch()
-    assert (
-        wait_for_exit(process, tmp_path, "container up did not exit after the signal")
-        == status
-    )
+        os.killpg(process.pid, first_signal)
+        if second_signal is not None:
+            wait_until_exists(
+                tmp_path / "down-ready", process, "Docker stub did not reach cleanup"
+            )
+            os.killpg(process.pid, second_signal)
+            (tmp_path / "docker-down-release").touch()
+        assert (
+            wait_for_exit(
+                process, tmp_path, "container up did not exit after the signal"
+            )
+            == status
+        )
     assert_exact_candidate_teardown(tmp_path)
 
 

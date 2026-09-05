@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator, Mapping
-from decimal import Decimal
 from typing import Any, assert_never
 
 import sqlalchemy as sa
@@ -24,6 +22,13 @@ from atelier2.adapters.dbos.names import (
     REPLACEMENT_WORKFLOW_NAME,
 )
 from atelier2.adapters.dbos.node_records import keep_node_receipt
+from atelier2.adapters.dbos.produced_node_values import (
+    NoProducibleValue,
+    declared_output_schema_document,
+    declared_output_schema_refusal,
+    schema_refusal_receipt_reason,
+    the_value_this_execution_produced,
+)
 from atelier2.adapters.dbos.run_store import (
     AgentReceiptConflict,
     ToolRedemptionConflict,
@@ -33,7 +38,6 @@ from atelier2.adapters.dbos.run_store import (
     _tool_redemption_values,
     load_kept_value,
     load_node_outputs,
-    load_published_schema_document,
     load_run_inputs,
 )
 from atelier2.adapters.dbos.run_transitions import (
@@ -59,6 +63,9 @@ from atelier2.adapters.dbos.schema import (
 )
 from atelier2.adapters.dbos.transactions import canonical_write_transaction
 from atelier2.adapters.dbos.uncontinuable_runs import live_driver_workflow_ids
+from atelier2.adapters.dbos.verification_failure_words import (
+    verification_failure_verdict,
+)
 from atelier2.adapters.dbos.workflow_ids import (
     cancellation_workflow_id_for,
     driving_workflow_ids,
@@ -85,25 +92,12 @@ from atelier2.contracts.agent_attempts import (
     AgentProcessOwnerId,
     CancelAgentAttemptRequest,
     OutputSchemaRefusalReceipt,
-    ProcessExitSignature,
-    RunnerBindingConflict,
-    RunnerCancellation,
-    RunnerCancellationObservation,
     RunnerEvidenceAcceptancePhase,
-    RunnerGenerationBinding,
     RunnerGenerationId,
     RunnerInvocationId,
-    RunnerInvocationLost,
     RunnerManifestId,
-    RunnerOutputLimitExceeded,
-    RunnerProcessBoundaryFailure,
-    RunnerProviderFailure,
-    RunnerProviderResult,
-    RunnerTerminalEvidenceAckTombstone,
-    RunnerTerminalEvidenceEnvelope,
     RunnerTerminalEvidenceHash,
     WatchdogGenerationId,
-    process_exit_verdict,
 )
 from atelier2.contracts.agent_permissions import (
     PermissionAuthority,
@@ -120,8 +114,6 @@ from atelier2.contracts.agent_refusals import (
 )
 from atelier2.contracts.agent_transcripts import AttemptTranscript
 from atelier2.contracts.agents import (
-    MAXIMUM_AGENT_FIELD_CHARACTERS,
-    MAXIMUM_AGENT_OUTPUT_BYTES_V2,
     AgentExecutionRequestHash,
     AgentExecutionRequestV2,
     AgentExecutionResult,
@@ -150,6 +142,10 @@ from atelier2.contracts.node_records_v3 import (
     node_receipt_reason,
 )
 from atelier2.contracts.pages import PageLimit
+from atelier2.contracts.process_endings import (
+    ProcessExitSignature,
+    process_exit_verdict,
+)
 from atelier2.contracts.revisions_v3 import PublishedRevisionHash
 from atelier2.contracts.run_bindings import RunV2, RunV3
 from atelier2.contracts.run_cancellations import (
@@ -164,14 +160,7 @@ from atelier2.contracts.runs import (
     RunState,
     WorkflowRevisionHash,
 )
-from atelier2.contracts.schemas_v3 import (
-    InstanceRefused,
-    SchemaRefused,
-    read_instance_document,
-    read_schema_document,
-)
 from atelier2.contracts.tool_grants_v3 import (
-    MAXIMUM_RECEIPTED_VERIFICATION_SUMMARY_BYTES,
     ToolRedemptionReceipt,
 )
 from atelier2.contracts.verdicts import Verdict, read_verdict
@@ -207,7 +196,6 @@ from atelier2.ports.agent_attempts import (
     AgentExecutorBindingRefusalNeedsPreparedCleanup,
     AgentExecutorBindingRefusalResult,
     AgentExecutorBindingRefusalWritten,
-    KeptEvidence,
     ProjectVerificationFailureEvidence,
     RunCancellationAccepted,
     RunCancellationCommandConflict,
@@ -217,10 +205,6 @@ from atelier2.ports.agent_attempts import (
     RunCancellationResult,
     RunCancellationRunMissing,
     RunCancellationTerminalRetry,
-    RunnerTerminalEvidenceCommitRefused,
-    RunnerTerminalEvidenceCommitResult,
-    RunnerTerminalEvidenceCommitted,
-    RunnerTerminalEvidenceRefusal,
 )
 from atelier2.ports.durable_runs import DurableStateCorrupt as PortDurableStateCorrupt
 
@@ -851,7 +835,6 @@ def _fail_current_attempt(
     receipt_reason: str,
     schema_revision: PublishedRevisionHash | None = None,
     judged_value: bytes | None = None,
-    runner_evidence_hash: RunnerTerminalEvidenceHash | None = None,
     transcript: AttemptTranscript | None = None,
     redemption: ToolRedemptionReceipt | None = None,
     terminal_node_failure: bool = True,
@@ -914,22 +897,6 @@ def _fail_current_attempt(
         "failure_code": failure.value,
         **_kept_transcript_values(connection, transcript),
     }
-    if runner_evidence_hash is not None:
-        values.update(
-            runner_terminal_evidence_hash=runner_evidence_hash.value,
-            runner_evidence_acceptance_phase=(
-                RunnerEvidenceAcceptancePhase.CORE_COMMITTED.value
-            ),
-        )
-        if durable.state is AgentAttemptState.CANCEL_REQUESTED:
-            values.update(
-                cancellation_command_id=None,
-                cancellation_expected_state_version=None,
-                replacement=None,
-                redrive_state=None,
-                cancellation_disposition=None,
-                cancellation_workflow_id=None,
-            )
     updated = connection.execute(
         agent_attempts.update()
         .where(
@@ -962,78 +929,91 @@ def _fail_current_attempt(
     return AgentAttemptFailed(durable_failure)
 
 
-def _declared_output_schema_refusal(
-    session: Any, node_id: str, declared: NodeOutput, payload: bytes
-) -> InstanceRefused | None:
-    """Read one declared output against its pinned schema without losing its shape."""
-    document = load_published_schema_document(
-        session, declared.schema_reference.revision
+def _agent_declared_refusal(
+    connection: Any,
+    execution: AgentAttemptExecution,
+    durable: AgentAttempt,
+    declared: NodeOutput,
+    result: AgentExecutionResult,
+    redemption: ToolRedemptionReceipt | None,
+) -> AgentAttemptFailed | None:
+    """This node's declared refusal form, where the provider answered with one."""
+
+    if declared.refusal is None:
+        return None
+    named = agent_refusal_reason(result.output_bytes)
+    if named is None:
+        return None
+    return _fail_current_attempt(
+        connection,
+        execution,
+        durable,
+        AgentAttemptFailureCode.AGENT_REFUSED,
+        node_receipt_reason(NodeReceiptReason.AGENT_REFUSED, named),
+        AGENT_REFUSAL_SCHEMA.revision_hash,
+        result.output_bytes,
+        result.transcript,
+        redemption,
     )
-    if document is None:
-        raise RunTransitionConflict(
-            f"the schema node {node_id!r} pinned for output "
-            f"{declared.name!r} is absent from the store"
-        )
-    schema = read_schema_document(document)
-    if isinstance(schema, SchemaRefused):
-        raise RunTransitionConflict(
-            f"the schema node {node_id!r} pinned for output "
-            f"{declared.name!r} is not one: {schema}"
-        )
-    # The byte bound belongs to the route the value arrived by
-    # (schemas_v3.py's read_instance_document docstring), and an agent output
-    # arrives through the provider frame, not an inline order: its route bound
-    # is MAXIMUM_AGENT_OUTPUT_BYTES_V2, not read_instance_document's inline
-    # default. #901 slice 5's V3 schema validation newly applied the inline
-    # door's bound to outputs the provider frame legally admits, refusing a
-    # legal answer before the schema itself was ever consulted.
-    verdict = read_instance_document(
-        payload, schema, maximum_bytes=MAXIMUM_AGENT_OUTPUT_BYTES_V2
+
+
+def _refused_by_the_project(
+    connection: Any,
+    execution: AgentAttemptExecution,
+    durable: AgentAttempt,
+    declared: NodeOutput,
+    result: AgentExecutionResult,
+    redemption: ToolRedemptionReceipt,
+    evidence: ProjectVerificationFailureEvidence | None,
+) -> AgentAttemptFailed:
+    """End an attempt whose granted check said no, with the answer it said no to.
+
+    The schema admitted these bytes, and that judgment is kept with the ending:
+    a reader who cannot see what the provider answered cannot tell a broken
+    build from a builder that did nothing (#1156).
+    """
+
+    return _fail_current_attempt(
+        connection,
+        execution,
+        durable,
+        AgentAttemptFailureCode.PROJECT_VERIFICATION_FAILED,
+        node_receipt_reason(
+            NodeReceiptReason.PROJECT_VERIFICATION_FAILED,
+            verification_failure_verdict(redemption, evidence),
+        ),
+        PublishedRevisionHash(declared.schema_reference.revision),
+        result.output_bytes,
+        transcript=result.transcript,
     )
-    return verdict if isinstance(verdict, InstanceRefused) else None
 
 
-def _value_at_schema_violation(payload: bytes, pointer: str | None) -> object:
-    """Read the one JSON value whose repr JSON Schema put in its diagnostic."""
-    value: object = json.loads(payload.decode("utf-8"), parse_float=Decimal)
-    if pointer is None:
-        return value
-    for escaped_part in pointer.removeprefix("/").split("/"):
-        part = escaped_part.replace("~1", "/").replace("~0", "~")
-        if isinstance(value, list):
-            value = value[int(part)]
-        elif isinstance(value, dict):
-            value = value[part]
-        else:
-            raise TypeError(
-                f"schema violation pointer {pointer!r} does not address its value"
-            )
-    return value
+def _refused_produced_value(
+    connection: Any,
+    execution: AgentAttemptExecution,
+    durable: AgentAttempt,
+    declared: NodeOutput,
+    produced: NoProducibleValue,
+    transcript: AttemptTranscript | None,
+    redemption: ToolRedemptionReceipt | None,
+) -> AgentAttemptFailed:
+    """End an attempt on the value the atelier composed, named after its author.
 
+    No repair round: the one this store orders asks the provider to answer
+    again, and the provider did not write what was refused here.
+    """
 
-def _schema_rule_without_rejected_value(reason: str, rejected_value: object) -> str:
-    """Remove exactly JSON Schema's repr of the rejected value from its rule."""
-    rendered_value = repr(rejected_value)
-    return reason.replace(rendered_value, "", 1).strip()
-
-
-def _compact_schema_refusal(refusal: InstanceRefused, payload: bytes) -> str:
-    """Name the schema's place and rule without embedding rejected output."""
-    violation = refusal.violation
-    if violation is None:
-        words = str(refusal)
-    else:
-        place = "the value itself" if violation.pointer is None else violation.pointer
-        words = (
-            f"{refusal.refusal.value}: {place}: "
-            f"{_schema_rule_without_rejected_value(violation.reason, _value_at_schema_violation(payload, violation.pointer))}"
-        )
-    maximum_words = (
-        MAXIMUM_AGENT_FIELD_CHARACTERS
-        - len(NodeReceiptReason.OUTPUT_SCHEMA_REFUSED.value)
-        - len(": ")
+    return _fail_current_attempt(
+        connection,
+        execution,
+        durable,
+        AgentAttemptFailureCode.PRODUCED_VALUE_REFUSED,
+        node_receipt_reason(NodeReceiptReason.PRODUCED_VALUE_REFUSED, produced.verdict),
+        PublishedRevisionHash(declared.schema_reference.revision),
+        produced.judged,
+        transcript=transcript,
+        redemption=redemption,
     )
-    return words[:maximum_words]
 
 
 def _store_output_schema_refusal_receipt(
@@ -1114,69 +1094,6 @@ def _proof_of_a_passed_check(
     if redemption is None or not redemption.satisfied_the_project:
         return None
     return redemption
-
-
-def _verification_failure_verdict(
-    redemption: ToolRedemptionReceipt,
-    evidence: ProjectVerificationFailureEvidence | None,
-) -> str:
-    """Everything a reader needs to judge a red check without rerunning it.
-
-    The exit code alone is six words that answer nothing: an operator cannot
-    tell a broken test from a broken environment from it (#1137). Every real
-    redemption failure supplies `evidence`, because the caller that ran the
-    check already read what it printed; it is absent only for a caller this
-    store cannot assume exists yet, so a missing evidence still names the exit
-    code and the command rather than raising.
-    """
-
-    words = [f"exit {redemption.exit_code}", " ".join(redemption.command)]
-    if evidence is not None:
-        words.append(f"after {evidence.duration_seconds:.0f} s")
-        if evidence.summary_line is not None:
-            words.append(_bounded_verification_summary(evidence.summary_line))
-        words.extend(_named_evidence("output", evidence.output))
-        words.extend(_named_evidence("candidate diff", evidence.candidate_diff))
-    return "; ".join(words)
-
-
-def _named_evidence(name: str, kept: KeptEvidence) -> tuple[str, ...]:
-    """Where one piece of this evidence was kept, or why it was not kept at all.
-
-    Silence is the honest answer for a piece that never existed -- a check that
-    printed nothing, an attempt with nothing to diff -- because a receipt saying
-    "no artifact" about something that was never there tells a reader nothing.
-    A piece that existed and could not be kept says so instead.
-    """
-
-    if kept.artifact_hash is not None:
-        return (
-            (f"{name} artifact sha256:{kept.artifact_hash.value}", f"{name} redacted")
-            if kept.redacted
-            else (f"{name} artifact sha256:{kept.artifact_hash.value}",)
-        )
-    if kept.retention_failure is not None:
-        return (f"{name} could not be kept: {kept.retention_failure}",)
-    return ()
-
-
-def _bounded_verification_summary(summary_line: str) -> str:
-    """Pytest's own summary line, bounded the way `ProcessExitSignature` bounds free text.
-
-    A project's own test runner is free to compose a summary of any length; a
-    receipt is a sentence an operator reads at a glance, not a log (#1137).
-    """
-
-    encoded = summary_line.encode("utf-8")
-    if len(encoded) <= MAXIMUM_RECEIPTED_VERIFICATION_SUMMARY_BYTES:
-        return summary_line
-    tail = encoded[-MAXIMUM_RECEIPTED_VERIFICATION_SUMMARY_BYTES:].decode(
-        "utf-8", "replace"
-    )
-    return (
-        f"last {MAXIMUM_RECEIPTED_VERIFICATION_SUMMARY_BYTES} of "
-        f"{len(encoded)} summary bytes: {tail}"
-    )
 
 
 def _keep_tool_redemption(
@@ -1687,154 +1604,6 @@ class DbosAgentAttemptStore:
                 return AgentExecutorBindingRefusalWritten()
             return AgentExecutorBindingRefusalFenced(attempt)
 
-    def bind_runner_generation(
-        self, execution: AgentAttemptExecution, binding: RunnerGenerationBinding
-    ) -> AgentAttempt:
-        if (
-            binding.attempt_id != execution.attempt_id
-            or binding.request_hash != execution.request.request_hash
-        ):
-            raise RunnerBindingConflict(
-                "runner generation differs from the exact attempt request"
-            )
-        with canonical_write_transaction(self._engine) as connection:
-            _validate_request(
-                connection,
-                execution.request,
-                execution.attempt_id,
-                execution.ordinal,
-            )
-            durable = _load_attempt(connection, execution.attempt_id)
-            _require_attempt_binding(durable, execution)
-            if durable.runner_manifest_id is not None:
-                if (
-                    durable.runner_manifest_id != binding.manifest_id
-                    or durable.runner_generation_id != binding.generation_id
-                ):
-                    raise RunnerBindingConflict(
-                        "runner binding retry differs from durable generation"
-                    )
-                return durable
-            if (
-                durable.state is not AgentAttemptState.PREPARED
-                or durable.process_phase is not AgentAttemptProcessPhase.NONE
-                or durable.runner_evidence_acceptance_phase
-                is not RunnerEvidenceAcceptancePhase.NONE
-            ):
-                raise RunnerBindingConflict(
-                    "only an unbound prepared attempt can bind a runner generation"
-                )
-            updated = connection.execute(
-                agent_attempts.update()
-                .where(
-                    agent_attempts.c.attempt_id == durable.attempt_id.value,
-                    agent_attempts.c.state == AgentAttemptState.PREPARED.value,
-                    agent_attempts.c.state_version == durable.state_version,
-                    agent_attempts.c.runner_manifest_id.is_(None),
-                )
-                .values(
-                    state_version=durable.state_version + 1,
-                    runner_manifest_id=binding.manifest_id.value,
-                    runner_generation_id=binding.generation_id.value,
-                )
-            )
-            if updated.rowcount != 1:
-                raise RunnerBindingConflict("runner binding lost its attempt CAS")
-            return _load_attempt(connection, durable.attempt_id)
-
-    def arm_runner_invocation(
-        self,
-        execution: AgentAttemptExecution,
-        binding: RunnerGenerationBinding,
-        invocation_id: RunnerInvocationId,
-    ) -> AgentAttempt:
-        if (
-            binding.attempt_id != execution.attempt_id
-            or binding.request_hash != execution.request.request_hash
-        ):
-            raise RunnerBindingConflict(
-                "runner invocation differs from the exact attempt request"
-            )
-        with canonical_write_transaction(self._engine) as connection:
-            _validate_request(
-                connection,
-                execution.request,
-                execution.attempt_id,
-                execution.ordinal,
-            )
-            durable = _load_attempt(connection, execution.attempt_id)
-            _require_attempt_binding(durable, execution)
-            self._require_durable_runner_binding(durable, binding)
-            if durable.runner_invocation_id is not None:
-                if durable.runner_invocation_id != invocation_id:
-                    raise RunnerBindingConflict(
-                        "runner invocation retry differs from durable invocation"
-                    )
-                if durable.state is AgentAttemptState.PREPARED:
-                    raise RunnerBindingConflict(
-                        "prepared runner evidence did not arm its invocation"
-                    )
-                return durable
-            if (
-                durable.state is not AgentAttemptState.PREPARED
-                or durable.runner_evidence_acceptance_phase
-                is not RunnerEvidenceAcceptancePhase.NONE
-            ):
-                raise RunnerBindingConflict(
-                    "only a bound prepared attempt can arm a runner invocation"
-                )
-            updated = connection.execute(
-                agent_attempts.update()
-                .where(
-                    agent_attempts.c.attempt_id == durable.attempt_id.value,
-                    agent_attempts.c.state == AgentAttemptState.PREPARED.value,
-                    agent_attempts.c.state_version == durable.state_version,
-                    agent_attempts.c.runner_invocation_id.is_(None),
-                )
-                .values(
-                    state=AgentAttemptState.LAUNCH_ARMED.value,
-                    state_version=durable.state_version + 1,
-                    runner_invocation_id=invocation_id.value,
-                )
-            )
-            if updated.rowcount != 1:
-                raise RunnerBindingConflict("runner invocation lost its attempt CAS")
-            return _load_attempt(connection, durable.attempt_id)
-
-    @staticmethod
-    def _require_durable_runner_binding(
-        durable: AgentAttempt, binding: RunnerGenerationBinding
-    ) -> None:
-        if (
-            durable.attempt_id != binding.attempt_id
-            or durable.request_hash != binding.request_hash
-            or durable.runner_manifest_id != binding.manifest_id
-            or durable.runner_generation_id != binding.generation_id
-        ):
-            raise RunnerBindingConflict(
-                "runner evidence differs from the durable generation binding"
-            )
-
-    @classmethod
-    def _require_durable_runner_envelope(
-        cls, durable: AgentAttempt, envelope: RunnerTerminalEvidenceEnvelope
-    ) -> None:
-        cls._require_durable_runner_binding(durable, envelope.binding)
-        if durable.runner_invocation_id != envelope.invocation_id:
-            raise RunnerBindingConflict(
-                "runner evidence differs from the durable invocation"
-            )
-
-    @classmethod
-    def _require_durable_runner_tombstone(
-        cls, durable: AgentAttempt, tombstone: RunnerTerminalEvidenceAckTombstone
-    ) -> None:
-        cls._require_durable_runner_binding(durable, tombstone.binding)
-        if durable.runner_invocation_id != tombstone.invocation_id:
-            raise RunnerBindingConflict(
-                "runner ACK differs from the durable invocation"
-            )
-
     def bind_watchdog(
         self,
         execution: AgentAttemptExecution,
@@ -2109,200 +1878,6 @@ class DbosAgentAttemptStore:
             if len(candidates) < page_limit.value:
                 return
 
-    def commit_runner_terminal_evidence(
-        self,
-        execution: AgentAttemptExecution,
-        envelope: RunnerTerminalEvidenceEnvelope,
-    ) -> RunnerTerminalEvidenceCommitResult:
-        if (
-            envelope.binding.attempt_id != execution.attempt_id
-            or envelope.binding.request_hash != execution.request.request_hash
-        ):
-            raise RunnerBindingConflict(
-                "runner evidence differs from the exact attempt request"
-            )
-        evidence_hash = RunnerTerminalEvidenceHash.for_envelope(envelope)
-        with canonical_write_transaction(self._engine) as connection:
-            run, graph = _validate_request(
-                connection,
-                execution.request,
-                execution.attempt_id,
-                execution.ordinal,
-            )
-            durable = _load_attempt(connection, execution.attempt_id)
-            _require_attempt_binding(durable, execution)
-            if durable.runner_terminal_evidence_hash is not None:
-                self._require_durable_runner_envelope(durable, envelope)
-                if durable.runner_terminal_evidence_hash != evidence_hash:
-                    raise RunnerBindingConflict(
-                        "runner evidence retry differs from the durable evidence"
-                    )
-                completion = None
-                if durable.state is AgentAttemptState.SUCCEEDED:
-                    completion = completion_after_node(
-                        graph,
-                        execution.request.node_id,
-                        execution.request.round_ordinal,
-                        _kept_verdict(connection, graph, execution.request),
-                    )
-                return RunnerTerminalEvidenceCommitted(
-                    durable, evidence_hash, completion
-                )
-            self._require_durable_runner_binding(durable, envelope.binding)
-            node = graph.node(execution.request.node_id)
-            if isinstance(node, AgentNodeV3) and node.tools:
-                return RunnerTerminalEvidenceCommitRefused(
-                    RunnerTerminalEvidenceRefusal.TOOL_GRANT_BOUND
-                )
-            evidence = envelope.evidence
-            if isinstance(evidence, RunnerCancellation) and (
-                evidence.observation is RunnerCancellationObservation.NEVER_LAUNCHED
-            ):
-                if (
-                    durable.state is not AgentAttemptState.PREPARED
-                    or durable.runner_invocation_id is not None
-                ):
-                    raise RunnerBindingConflict(
-                        "never-launched evidence requires its bound pre-arm attempt"
-                    )
-                updated = connection.execute(
-                    agent_attempts.update()
-                    .where(
-                        agent_attempts.c.attempt_id == durable.attempt_id.value,
-                        agent_attempts.c.state == AgentAttemptState.PREPARED.value,
-                        agent_attempts.c.state_version == durable.state_version,
-                        agent_attempts.c.runner_terminal_evidence_hash.is_(None),
-                    )
-                    .values(
-                        state_version=durable.state_version + 1,
-                        runner_invocation_id=(
-                            None
-                            if envelope.invocation_id is None
-                            else envelope.invocation_id.value
-                        ),
-                        runner_terminal_evidence_hash=evidence_hash.value,
-                        runner_evidence_acceptance_phase=(
-                            RunnerEvidenceAcceptancePhase.CORE_COMMITTED.value
-                        ),
-                    )
-                )
-                if updated.rowcount != 1:
-                    raise RunnerBindingConflict(
-                        "never-launched evidence lost its attempt CAS"
-                    )
-                return RunnerTerminalEvidenceCommitted(
-                    _load_attempt(connection, durable.attempt_id), evidence_hash
-                )
-
-            self._require_durable_runner_envelope(durable, envelope)
-            if isinstance(evidence, RunnerInvocationLost):
-                if durable.state is not AgentAttemptState.LAUNCH_ARMED:
-                    raise RunnerBindingConflict(
-                        "invocation loss requires its armed attempt"
-                    )
-                updated = connection.execute(
-                    agent_attempts.update()
-                    .where(
-                        agent_attempts.c.attempt_id == durable.attempt_id.value,
-                        agent_attempts.c.state == AgentAttemptState.LAUNCH_ARMED.value,
-                        agent_attempts.c.state_version == durable.state_version,
-                        agent_attempts.c.runner_terminal_evidence_hash.is_(None),
-                    )
-                    .values(
-                        state_version=durable.state_version + 1,
-                        runner_terminal_evidence_hash=evidence_hash.value,
-                        runner_evidence_acceptance_phase=(
-                            RunnerEvidenceAcceptancePhase.CORE_COMMITTED.value
-                        ),
-                    )
-                )
-                if updated.rowcount != 1:
-                    raise RunnerBindingConflict(
-                        "invocation-loss evidence lost its attempt CAS"
-                    )
-                return RunnerTerminalEvidenceCommitted(
-                    _load_attempt(connection, durable.attempt_id), evidence_hash
-                )
-
-            if (
-                durable.state
-                not in {
-                    AgentAttemptState.LAUNCH_ARMED,
-                    AgentAttemptState.CANCEL_REQUESTED,
-                }
-                or run.state is not RunState.STARTED
-                or run.current_node_id != execution.request.node_id
-                or run.current_round_ordinal != execution.request.round_ordinal
-            ):
-                raise RunnerBindingConflict(
-                    "only the armed current runner attempt can accept terminal evidence"
-                )
-            if isinstance(evidence, RunnerProviderResult):
-                outcome = self._commit_success(
-                    connection,
-                    execution,
-                    durable,
-                    run,
-                    graph,
-                    evidence.result,
-                    runner_evidence_hash=evidence_hash,
-                )
-                return RunnerTerminalEvidenceCommitted(
-                    outcome.attempt,
-                    evidence_hash,
-                    (
-                        outcome.completion
-                        if isinstance(outcome, AgentAttemptSucceeded)
-                        else None
-                    ),
-                )
-            if isinstance(evidence, RunnerProviderFailure):
-                failed = _fail_current_attempt(
-                    connection,
-                    execution,
-                    durable,
-                    AgentAttemptFailureCode.PROCESS_EXITED_UNSUCCESSFULLY,
-                    node_receipt_reason(
-                        NodeReceiptReason.PROCESS_EXITED_UNSUCCESSFULLY,
-                        evidence.exit_signature.named(),
-                    ),
-                    runner_evidence_hash=evidence_hash,
-                )
-                return RunnerTerminalEvidenceCommitted(failed.attempt, evidence_hash)
-            if isinstance(evidence, RunnerOutputLimitExceeded):
-                streams = ", ".join(
-                    stream.value
-                    for stream in sorted(
-                        evidence.exceeded_streams, key=lambda item: item.value
-                    )
-                )
-                failed = _fail_current_attempt(
-                    connection,
-                    execution,
-                    durable,
-                    AgentAttemptFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED,
-                    node_receipt_reason(
-                        NodeReceiptReason.PROCESS_OUTPUT_LIMIT_EXCEEDED, streams
-                    ),
-                    runner_evidence_hash=evidence_hash,
-                )
-                return RunnerTerminalEvidenceCommitted(failed.attempt, evidence_hash)
-            if isinstance(evidence, RunnerProcessBoundaryFailure):
-                failed = _fail_current_attempt(
-                    connection,
-                    execution,
-                    durable,
-                    AgentAttemptFailureCode.PROCESS_SUPERVISION_FAILED,
-                    node_receipt_reason(NodeReceiptReason.PROCESS_SUPERVISION_FAILED),
-                    runner_evidence_hash=evidence_hash,
-                )
-                return RunnerTerminalEvidenceCommitted(failed.attempt, evidence_hash)
-            if isinstance(evidence, RunnerCancellation):
-                return self._commit_runner_cancellation(
-                    connection, durable, evidence, evidence_hash
-                )
-            raise AssertionError("closed Runner evidence union was not exhaustive")
-
     def _commit_success(
         self,
         connection: Any,
@@ -2314,34 +1889,28 @@ class DbosAgentAttemptStore:
         *,
         redemption: ToolRedemptionReceipt | None = None,
         verification_failure_evidence: ProjectVerificationFailureEvidence | None = None,
-        runner_evidence_hash: RunnerTerminalEvidenceHash | None = None,
+        candidate_diff: str | None = None,
     ) -> AgentAttemptSucceeded | AgentAttemptFailed:
         request = execution.request
         node = _agent_node_for_attempt(graph, request.node_id)
         declared = node.outputs[0]
-        if declared.refusal is not None:
-            named = agent_refusal_reason(result.output_bytes)
-            if named is not None:
-                failed = _fail_current_attempt(
-                    connection,
-                    execution,
-                    durable,
-                    AgentAttemptFailureCode.AGENT_REFUSED,
-                    node_receipt_reason(NodeReceiptReason.AGENT_REFUSED, named),
-                    AGENT_REFUSAL_SCHEMA.revision_hash,
-                    result.output_bytes,
-                    runner_evidence_hash,
-                    result.transcript,
-                    _proof_of_a_passed_check(redemption),
-                )
-                return failed
-        refusal = _declared_output_schema_refusal(
-            connection, node.id, declared, result.output_bytes
+        declared_a_refusal = _agent_declared_refusal(
+            connection,
+            execution,
+            durable,
+            declared,
+            result,
+            _proof_of_a_passed_check(redemption),
+        )
+        if declared_a_refusal is not None:
+            return declared_a_refusal
+        schema_document = declared_output_schema_document(connection, node.id, declared)
+        refusal = declared_output_schema_refusal(
+            schema_document, node.id, declared, result.output_bytes
         )
         if refusal is not None:
-            reason = _compact_schema_refusal(refusal, result.output_bytes)
-            receipt_reason = node_receipt_reason(
-                NodeReceiptReason.OUTPUT_SCHEMA_REFUSED, reason
+            receipt_reason = schema_refusal_receipt_reason(
+                refusal, result.output_bytes, NodeReceiptReason.OUTPUT_SCHEMA_REFUSED
             )
             refusal_receipt = _store_output_schema_refusal_receipt(
                 connection,
@@ -2360,7 +1929,6 @@ class DbosAgentAttemptStore:
                     result,
                     refusal_receipt,
                     redemption,
-                    runner_evidence_hash,
                 )
             failed = _fail_current_attempt(
                 connection,
@@ -2370,32 +1938,32 @@ class DbosAgentAttemptStore:
                 receipt_reason,
                 PublishedRevisionHash(declared.schema_reference.revision),
                 result.output_bytes,
-                runner_evidence_hash,
                 result.transcript,
                 _proof_of_a_passed_check(redemption),
             )
             return failed
         if redemption is not None and redemption.exit_code != 0:
-            # The bytes reached here past the refusal above, which means this
-            # node's own declared schema admitted them. That judgment is kept
-            # with the ending, exactly as a refused one is: the check said no to
-            # work, and a reader who cannot see what the provider answered
-            # cannot tell a broken build from a builder that did nothing (#1156).
-            return _fail_current_attempt(
+            return _refused_by_the_project(
                 connection,
                 execution,
                 durable,
-                AgentAttemptFailureCode.PROJECT_VERIFICATION_FAILED,
-                node_receipt_reason(
-                    NodeReceiptReason.PROJECT_VERIFICATION_FAILED,
-                    _verification_failure_verdict(
-                        redemption, verification_failure_evidence
-                    ),
-                ),
-                PublishedRevisionHash(declared.schema_reference.revision),
-                result.output_bytes,
-                runner_evidence_hash=runner_evidence_hash,
-                transcript=result.transcript,
+                declared,
+                result,
+                redemption,
+                verification_failure_evidence,
+            )
+        node_value = the_value_this_execution_produced(
+            schema_document, node.id, declared, result.output_bytes, candidate_diff
+        )
+        if isinstance(node_value, NoProducibleValue):
+            return _refused_produced_value(
+                connection,
+                execution,
+                durable,
+                declared,
+                node_value,
+                result.transcript,
+                _proof_of_a_passed_check(redemption),
             )
         receipt = AgentReceiptV2.for_execution(request, run.binding_set_hash, result)
         connection.execute(
@@ -2429,7 +1997,7 @@ class DbosAgentAttemptStore:
                 request.node_execution_id,
                 declared.name,
                 PublishedRevisionHash(declared.schema_reference.revision),
-                result.output_bytes,
+                node_value,
             ),
         )
         values: dict[str, object] = {
@@ -2438,22 +2006,6 @@ class DbosAgentAttemptStore:
             "receipt_hash": receipt.receipt_hash.value,
             **_kept_transcript_values(connection, result.transcript),
         }
-        if runner_evidence_hash is not None:
-            values.update(
-                runner_terminal_evidence_hash=runner_evidence_hash.value,
-                runner_evidence_acceptance_phase=(
-                    RunnerEvidenceAcceptancePhase.CORE_COMMITTED.value
-                ),
-            )
-            if durable.state is AgentAttemptState.CANCEL_REQUESTED:
-                values.update(
-                    cancellation_command_id=None,
-                    cancellation_expected_state_version=None,
-                    replacement=None,
-                    redrive_state=None,
-                    cancellation_disposition=None,
-                    cancellation_workflow_id=None,
-                )
         updated = connection.execute(
             agent_attempts.update()
             .where(
@@ -2499,7 +2051,7 @@ class DbosAgentAttemptStore:
             request.workflow_revision_hash,
             request.node_id,
             RunEventKind.AGENT_COMPLETED,
-            result.output_bytes,
+            node_value,
             RunState.STARTED,
             target_state,
             target_node_id,
@@ -2524,7 +2076,6 @@ class DbosAgentAttemptStore:
         result: AgentExecutionResult,
         refusal_receipt: OutputSchemaRefusalReceipt,
         redemption: ToolRedemptionReceipt | None,
-        runner_evidence_hash: RunnerTerminalEvidenceHash | None,
     ) -> AgentAttemptFailed:
         request = execution.request
         failed = _fail_current_attempt(
@@ -2535,7 +2086,6 @@ class DbosAgentAttemptStore:
             refusal_receipt.reason,
             refusal_receipt.schema_revision,
             result.output_bytes,
-            runner_evidence_hash,
             result.transcript,
             _proof_of_a_passed_check(redemption),
             terminal_node_failure=False,
@@ -2578,217 +2128,13 @@ class DbosAgentAttemptStore:
             client.destroy()
         return failed
 
-    def _commit_runner_cancellation(
-        self,
-        connection: Any,
-        durable: AgentAttempt,
-        evidence: RunnerCancellation,
-        evidence_hash: RunnerTerminalEvidenceHash,
-    ) -> RunnerTerminalEvidenceCommitted:
-        cancellation = durable.cancellation
-        if (
-            durable.state is not AgentAttemptState.CANCEL_REQUESTED
-            or cancellation is None
-            or cancellation.command_id != evidence.command_id
-            or cancellation.replacement is not AgentAttemptReplacement.NONE
-        ):
-            raise RunnerBindingConflict(
-                "runner cancellation evidence differs from its Core command"
-            )
-        dispositions = {
-            RunnerCancellationObservation.EXITED_BEFORE_SIGNAL: (
-                AgentAttemptCancellationDisposition.EXITED_BEFORE_SIGNAL
-            ),
-            RunnerCancellationObservation.REAPED_AFTER_TERM: (
-                AgentAttemptCancellationDisposition.REAPED_AFTER_TERM
-            ),
-            RunnerCancellationObservation.REAPED_AFTER_KILL: (
-                AgentAttemptCancellationDisposition.REAPED_AFTER_KILL
-            ),
-        }
-        disposition = dispositions.get(evidence.observation)
-        if disposition is None:
-            raise RunnerBindingConflict(
-                "never-launched evidence cannot terminally cancel an attempt"
-            )
-        updated = connection.execute(
-            agent_attempts.update()
-            .where(
-                agent_attempts.c.attempt_id == durable.attempt_id.value,
-                agent_attempts.c.state == AgentAttemptState.CANCEL_REQUESTED.value,
-                agent_attempts.c.state_version == durable.state_version,
-                agent_attempts.c.cancellation_command_id == evidence.command_id,
-                agent_attempts.c.runner_terminal_evidence_hash.is_(None),
-            )
-            .values(
-                state=AgentAttemptState.CANCELLED.value,
-                state_version=durable.state_version + 1,
-                redrive_state=AgentAttemptRedriveState.CLEANUP_ATTESTED.value,
-                cancellation_disposition=disposition.value,
-                runner_terminal_evidence_hash=evidence_hash.value,
-                runner_evidence_acceptance_phase=(
-                    RunnerEvidenceAcceptancePhase.CORE_COMMITTED.value
-                ),
-            )
-        )
-        if updated.rowcount != 1:
-            raise RunnerBindingConflict("runner cancellation lost its attempt CAS")
-        record_attempt_ended(connection, durable.attempt_id.value)
-        terminal = _load_attempt(connection, durable.attempt_id)
-        _insert_attempt_event(
-            connection,
-            terminal,
-            RunEventKind.AGENT_CANCELLED,
-            command=terminal.cancellation,
-        )
-        _lift_run_under_operator_cancel(connection, terminal)
-        return RunnerTerminalEvidenceCommitted(terminal, evidence_hash)
-
-    def commit_never_launched_cancellation(
-        self, request: CancelAgentAttemptRequest
-    ) -> AgentAttemptCancellationAccepted:
-        """End one leased-but-never-launched runner attempt under operator cancel.
-
-        The only proof this transition ever runs on is a *won* lease withdraw,
-        which its caller (`cancel_runner_attempt`) has already obtained; this
-        write never re-derives it. The terminal row keeps the attempt's runner
-        binding (`runner_manifest_id`/`runner_generation_id` preserved) so it
-        stays legible as a runner attempt, leaves `runner_invocation_id` NULL
-        and fabricates no evidence -- acceptance phase stays `NONE`, the
-        terminal evidence hash stays NULL -- and records disposition
-        `NEVER_LAUNCHED` on the redrive axis, with `process_phase` `NONE`
-        because a runner-bound row may never carry `CLEANUP_ATTESTED`.
-
-        Idempotent: a re-run after the commit already landed reads the durable
-        terminal row and returns it without a second CAS, event or run lift,
-        exactly like `attest_cancellation_cleanup`'s own terminal short-circuit.
-        """
-
-        with canonical_write_transaction(self._engine) as connection:
-            attempt = _load_attempt(connection, request.attempt_id)
-            if attempt.runner_manifest_id is None:
-                raise RunTransitionConflict(
-                    "never-launched cancellation requires a runner-bound attempt"
-                )
-            cancellation = attempt.cancellation
-            if cancellation is None or not cancellation.matches(request):
-                raise RunTransitionConflict(
-                    "never-launched cancel differs from its cancellation command"
-                )
-            if attempt.state in {
-                AgentAttemptState.CANCELLED,
-                AgentAttemptState.INTERRUPTED,
-            }:
-                if (
-                    cancellation.disposition
-                    is not AgentAttemptCancellationDisposition.NEVER_LAUNCHED
-                ):
-                    raise RunTransitionConflict(
-                        "never-launched cancel retry differs from durable disposition"
-                    )
-                return AgentAttemptCancellationAccepted(
-                    attempt,
-                    True,
-                    self._replacement_attempt_id(connection, attempt),
-                )
-            if attempt.state is not AgentAttemptState.CANCEL_REQUESTED:
-                raise RunTransitionConflict(
-                    "only a requested cancellation can commit never-launched"
-                )
-            if attempt.runner_invocation_id is not None:
-                raise RunTransitionConflict(
-                    "a launched runner attempt cannot commit never-launched"
-                )
-            updated = connection.execute(
-                agent_attempts.update()
-                .where(
-                    agent_attempts.c.attempt_id == attempt.attempt_id.value,
-                    agent_attempts.c.state == AgentAttemptState.CANCEL_REQUESTED.value,
-                    agent_attempts.c.state_version == attempt.state_version,
-                    agent_attempts.c.cancellation_command_id == request.command_id,
-                    agent_attempts.c.runner_invocation_id.is_(None),
-                )
-                .values(
-                    state=AgentAttemptState.CANCELLED.value,
-                    state_version=attempt.state_version + 1,
-                    redrive_state=AgentAttemptRedriveState.CLEANUP_ATTESTED.value,
-                    cancellation_disposition=(
-                        AgentAttemptCancellationDisposition.NEVER_LAUNCHED.value
-                    ),
-                )
-            )
-            if updated.rowcount != 1:
-                raise RunTransitionConflict(
-                    "never-launched cancellation lost its attempt CAS"
-                )
-            record_attempt_ended(connection, attempt.attempt_id.value)
-            terminal = _load_attempt(connection, attempt.attempt_id)
-            _insert_attempt_event(
-                connection,
-                terminal,
-                RunEventKind.AGENT_CANCELLED,
-                command=terminal.cancellation,
-            )
-            _lift_run_under_operator_cancel(connection, terminal)
-            return AgentAttemptCancellationAccepted(
-                terminal,
-                True,
-                self._replacement_attempt_id(connection, terminal),
-            )
-
-    def mark_runner_evidence_acknowledged(
-        self,
-        execution: AgentAttemptExecution,
-        tombstone: RunnerTerminalEvidenceAckTombstone,
-    ) -> AgentAttempt:
-        evidence_hash = tombstone.evidence_hash
-        with canonical_write_transaction(self._engine) as connection:
-            durable = _load_attempt(connection, execution.attempt_id)
-            _require_attempt_binding(durable, execution)
-            self._require_durable_runner_tombstone(durable, tombstone)
-            if durable.runner_terminal_evidence_hash != evidence_hash:
-                raise RunnerBindingConflict(
-                    "runner ACK differs from the durable evidence"
-                )
-            if (
-                durable.runner_evidence_acceptance_phase
-                is RunnerEvidenceAcceptancePhase.ACKNOWLEDGED
-            ):
-                return durable
-            if (
-                durable.runner_evidence_acceptance_phase
-                is not RunnerEvidenceAcceptancePhase.CORE_COMMITTED
-            ):
-                raise RunnerBindingConflict(
-                    "runner evidence must commit before it can be acknowledged"
-                )
-            updated = connection.execute(
-                agent_attempts.update()
-                .where(
-                    agent_attempts.c.attempt_id == durable.attempt_id.value,
-                    agent_attempts.c.state_version == durable.state_version,
-                    agent_attempts.c.runner_terminal_evidence_hash
-                    == evidence_hash.value,
-                    agent_attempts.c.runner_evidence_acceptance_phase
-                    == RunnerEvidenceAcceptancePhase.CORE_COMMITTED.value,
-                )
-                .values(
-                    state_version=durable.state_version + 1,
-                    runner_evidence_acceptance_phase=(
-                        RunnerEvidenceAcceptancePhase.ACKNOWLEDGED.value
-                    ),
-                )
-            )
-            if updated.rowcount != 1:
-                raise RunnerBindingConflict("runner ACK lost its attempt CAS")
-            return _load_attempt(connection, durable.attempt_id)
-
     def complete_success(
         self,
         execution: AgentAttemptExecution,
         result: AgentExecutionResult,
         redemption: ToolRedemptionReceipt | None = None,
         verification_failure_evidence: ProjectVerificationFailureEvidence | None = None,
+        candidate_diff: str | None = None,
     ) -> AgentAttemptSucceeded | AgentAttemptFailed:
         """Write the one success this attempt is allowed, or its named refusal.
 
@@ -2802,18 +2148,16 @@ class DbosAgentAttemptStore:
         refusal records a nonterminal `AGENT_FAILED` event and orders its repair;
         only an ordinal-two refusal also writes the terminal `failed`
         `node-receipt/v3`. Both attempts use the same failure seam
-        `PROCESS_EXITED_UNSUCCESSFULLY` runs on today, so the driver ends named
-        instead of dying on an exception nobody stored.
+        `PROCESS_EXITED_UNSUCCESSFULLY` runs on today.
         A granted verification that exits nonzero is the same named seam under
         `PROJECT_VERIFICATION_FAILED`, with how the command ended in the reason
         and without a `tool_redemptions` row. `verification_failure_evidence`
-        names, in that same reason, what the redemption's exit code alone does
-        not: pytest's own summary line where the retained tail carried one, and
-        the address of the artifact that tail was kept under.
+        names, in that same reason, pytest's own summary line where the retained
+        tail carried one, and the address that tail was kept under.
 
         A V3 success additionally keeps what the run now knows durably: the
-        produced value as `node-artifact/v3` and the `succeeded`
-        `node-receipt/v3` naming it, in this same transaction.
+        produced value (`produced_node_values.py`) as `node-artifact/v3` and the
+        `succeeded` `node-receipt/v3` naming it, in this same transaction.
         """
         request = execution.request
         attempt_id = execution.attempt_id
@@ -2841,6 +2185,7 @@ class DbosAgentAttemptStore:
                 result,
                 redemption=redemption,
                 verification_failure_evidence=verification_failure_evidence,
+                candidate_diff=candidate_diff,
             )
 
     def complete_known_failure(
