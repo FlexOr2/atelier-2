@@ -81,6 +81,7 @@ from atelier2.contracts.tool_grants_v3 import DeclaredToolGrant
 from atelier2.contracts.work_items import (
     WORK_ITEM_ORDER_SCHEMA_REVISION,
     WorkItemKind,
+    WorkItemOrderDocument,
     read_work_item_order_document,
 )
 from atelier2.contracts.workflow_formats import WorkflowFormatVersion
@@ -157,7 +158,9 @@ def graph_action_intent(
     effect_adapter_binding = _binding_for(effect_adapter_bindings, operation.operation)
     request = CanonicalRequest(payload)
     if operation.operation is AdapterOperationName.OPEN_PR:
+        work_item = None
         if project_id is not None:
+            work_item = _issue_work_item_order(session, run_id)
             head_branch = _confirmed_push_branch(
                 session,
                 run_id,
@@ -172,7 +175,13 @@ def graph_action_intent(
             body = payload.decode("utf-8")
         except UnicodeDecodeError as error:
             raise RunEffectConflict("open-pr Action output is not UTF-8") from error
-        request = CanonicalRequest(OpenPullRequest(body, head_branch).canonical_bytes())
+        request = CanonicalRequest(
+            OpenPullRequest(
+                body,
+                head_branch,
+                work_item.reference if work_item is not None else None,
+            ).canonical_bytes()
+        )
     binding = EffectBinding(
         logical_effect_key_for_node(
             run_id, revision_hash, action.id, run.current_round_ordinal
@@ -547,18 +556,25 @@ def graph_agent_open_pr_intent(
         AdapterOperationName.OPEN_PR,
     )
     payload = _agent_output(session, execution_id)
-    head_branch = (
-        _head_branch(session, run_id, project_id)
-        if project_id is not None
-        else head_branch_for_unbound_request(payload)
-    )
+    if project_id is None:
+        work_item = None
+        head_branch = head_branch_for_unbound_request(payload)
+    else:
+        work_item = _issue_work_item_order(session, run_id)
+        head_branch = _head_branch_for_work_item(work_item, project_id)
     try:
         body = payload.decode("utf-8")
     except UnicodeDecodeError as error:
         raise RunEffectConflict("open-pr Agent output is not UTF-8") from error
     return EffectIntent(
         binding,
-        CanonicalRequest(OpenPullRequest(body, head_branch).canonical_bytes()),
+        CanonicalRequest(
+            OpenPullRequest(
+                body,
+                head_branch,
+                work_item.reference if work_item is not None else None,
+            ).canonical_bytes()
+        ),
     )
 
 
@@ -787,6 +803,20 @@ def _binding_for(
 
 
 def _head_branch(session: Any, run_id: RunId, project_id: ProjectId):
+    return _head_branch_for_work_item(
+        _issue_work_item_order(session, run_id), project_id
+    )
+
+
+def _head_branch_for_work_item(
+    work_item: WorkItemOrderDocument, project_id: ProjectId
+) -> HeadBranch:
+    return head_branch_for_queue_item(
+        WorkItemReference(project_id, work_item.reference).item_id
+    )
+
+
+def _issue_work_item_order(session: Any, run_id: RunId) -> WorkItemOrderDocument:
     rows = session.execute(
         sa.select(
             run_inputs_v3.c.schema_revision_hash,
@@ -807,6 +837,4 @@ def _head_branch(session: Any, run_id: RunId, project_id: ProjectId):
         orders.append(order)
     if len(orders) != 1:
         raise RunEffectConflict("push requires exactly one issue work-item order")
-    return head_branch_for_queue_item(
-        WorkItemReference(project_id, orders[0].reference).item_id
-    )
+    return orders[0]

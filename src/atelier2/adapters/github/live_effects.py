@@ -69,6 +69,7 @@ from atelier2.contracts.effect_requests import (
     HeadBranch,
     OpenPullRequest,
     ReviewedDocumentationPullRequest,
+    github_issue_number,
 )
 from atelier2.contracts.effects import (
     AdapterOperationalIdentity,
@@ -139,17 +140,11 @@ _RENDERED_BODY_TRUNCATION_NOTE = "\n\n[truncated at 4000 characters]"
 
 _ACCEPTANCE_LINE_PREFIX = "Literal acceptance sentence(s)"
 
-# The repository's acceptance gate (`scripts/check_acceptance.py`'s
-# `LANDING_FIELD`) and this adapter's own trailer readback
-# (`contracts.effect_markers.body_carries_request_hash`) both recognise a
-# reserved line by how it starts, wherever it sits in the body. A candidate's
-# summary or changed paths are provider text, never trusted to hold one: a
-# line that would otherwise read as either marker is quoted with a leading
-# "> " before it reaches the rendered body, so the acceptance line and the
-# trailer this module appends afterward stay the only unframed reserved lines.
+# Candidate prose cannot supply reserved control lines.
 _RESERVED_LINE_PATTERN = re.compile(
     r"^[ \t]*[-*]?[ \t]*"
-    rf"({re.escape(_ACCEPTANCE_LINE_PREFIX)}|{re.escape(EFFECT_REQUEST_MARKER_KEY)})"
+    rf"({re.escape(_ACCEPTANCE_LINE_PREFIX)}|{re.escape('Work-Item:')}|"
+    rf"{re.escape('Closes #')}|{re.escape(EFFECT_REQUEST_MARKER_KEY)})"
 )
 
 
@@ -453,11 +448,9 @@ def _rendered_open_pull_request(
             "Changed paths:\n" + "\n".join(f"- {path}" for path in changed_paths)
         )
     prose = _escape_reserved_lines("\n\n".join(sections))
-    # The acceptance line and the trailer are the two trusted, unframed
-    # reserved lines this body may carry (ADR-owned by the acceptance gate
-    # and by `contracts.effect_markers`); bounding them together with the
-    # provider prose is what keeps the *complete* body, not just the prose,
-    # inside the 4000-character ceiling.
+    if request.work_item_reference is not None:
+        issue_number = github_issue_number(request.work_item_reference)
+        prose += f"\n\nWork-Item: #{issue_number}\n\nCloses #{issue_number}"
     tail = (
         f"\n\n{_acceptance_line(request.head_branch)}\n\n{marker_line(request_hash)}\n"
     )
