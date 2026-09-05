@@ -31,7 +31,6 @@ from atelier2.contracts.agent_attempts import (
     AgentAttemptReplacement,
     AgentProcessOwnerId,
     CancelAgentAttemptRequest,
-    ProcessExitSignature,
     WatchdogGenerationId,
 )
 from atelier2.contracts.agent_permissions import (
@@ -51,6 +50,7 @@ from atelier2.contracts.agent_transcripts import (
 )
 from atelier2.contracts.agents import AgentExecutorRevision
 from atelier2.contracts.executions import AgentAttemptExecution
+from atelier2.contracts.process_endings import ProcessExitSignature
 from atelier2.ports.agent_executions import (
     AgentProcessCompletion,
     AgentProcessInvocation,
