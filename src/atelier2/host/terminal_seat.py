@@ -32,10 +32,8 @@ from typing import NoReturn, Protocol
 
 from atelier2.contracts.hashing import Sha256Hash
 from atelier2.contracts.host_configuration import ProjectId
+from atelier2.host.address import DEFAULT_HOST, loopback_service_url
 
-# The seat binds loopback unconditionally, unlike the API's configurable host:
-# a pty is a shell, and the machine itself is the whole trust boundary.
-SEAT_BIND_ADDRESS = "127.0.0.1"
 DEFAULT_SEAT_PORT = 7681
 SEAT_PATH_TOKEN_BYTES = 24
 SEAT_STAGED_NAME_BYTES = 8
@@ -194,7 +192,7 @@ class TerminalSeat:
     def url(self) -> str:
         """Where a browser on this machine reaches the seat."""
 
-        return f"http://{SEAT_BIND_ADDRESS}:{self.settings.port}{self.base_path}/"
+        return loopback_service_url(self.settings.port, f"{self.base_path}/")
 
     def ensure_session(self) -> TerminalSeatOutcome:
         """Create the seat's session, or find the one that is already running."""
@@ -244,6 +242,8 @@ class TerminalSeat:
     def ttyd_command(self) -> tuple[str, ...]:
         """The serve's ttyd child: loopback, writable, origin-checked, no login.
 
+        It binds the loopback host unconditionally, where the API's host is a
+        setting: a pty is a shell, so this machine is the whole trust boundary.
         `-O` refuses a WebSocket whose origin is not ttyd's own page, which is
         the origin the seat's iframe carries; the drawn base path is what a page
         that was never told it cannot reach, since a rebound name passes the
@@ -253,7 +253,7 @@ class TerminalSeat:
         return (
             str(self.settings.ttyd_executable),
             "-i",
-            SEAT_BIND_ADDRESS,
+            DEFAULT_HOST,
             "-p",
             str(self.settings.port),
             "-W",
