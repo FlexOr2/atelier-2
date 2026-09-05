@@ -1005,7 +1005,7 @@ def test_execute_without_a_work_item_reference_opens_without_typed_lines(
     assert "Closes #" not in body
 
 
-def test_execute_quotes_work_item_lines_supplied_by_the_candidate(
+def test_execute_neutralizes_work_item_lines_supplied_by_the_candidate(
     factory: LiveGitHubEffectAdapterFactory,
     server: _FakeGitHubServer,
 ) -> None:
@@ -1021,8 +1021,38 @@ def test_execute_quotes_work_item_lines_supplied_by_the_candidate(
         adapter.close()
 
     body = str(server.pull_requests[0]["body"])
-    assert "> Work-Item: #999" in body
-    assert "> Closes #999" in body
+    assert "Work-Item: #999" not in body
+    assert "Closes #999" not in body
+    assert "Work-Item: #1232" in body
+    assert "Closes #1232" in body
+
+
+def test_execute_neutralizes_a_candidates_own_closing_keyword_and_no_item_label(
+    factory: LiveGitHubEffectAdapterFactory,
+    server: _FakeGitHubServer,
+) -> None:
+    """A candidate's own prose cannot close or reclassify another issue.
+
+    GitHub retires an issue on `close|fix|resolve` plus a reference anywhere on
+    a line, case-insensitively, exactly as `agent-claim`'s own
+    `closing_references` scans; neither keyword form nor the `No-Item:` label a
+    candidate writes may survive rendering, so only this adapter's own
+    `Work-Item`/`Closes` lines for the run's real item remain live.
+    """
+    intent = effect_intent(
+        _candidate_report_bytes("Fixes #99.\n\nNo-Item: fix", []),
+        work_item_reference=TrackerItemReference("gh:1232"),
+    )
+
+    adapter = factory.open()
+    try:
+        adapter.execute(intent)
+    finally:
+        adapter.close()
+
+    body = str(server.pull_requests[0]["body"])
+    assert "Fixes #99" not in body
+    assert "No-Item:" not in body
     assert "Work-Item: #1232" in body
     assert "Closes #1232" in body
 
@@ -1123,6 +1153,29 @@ def test_a_long_summary_is_truncated_but_the_acceptance_line_and_trailer_survive
     assert body_carries_request_hash(body, intent.request.request_hash.value)
     assert isinstance(read_back, EffectReceipt)
     assert read_back.effect_id.value == str(server.pull_requests[0]["number"])
+
+
+def test_a_long_summary_is_truncated_but_the_work_item_lines_survive(
+    factory: LiveGitHubEffectAdapterFactory, server: _FakeGitHubServer
+) -> None:
+    intent = effect_intent(
+        _candidate_report_bytes("x" * 5000, []),
+        work_item_reference=TrackerItemReference("gh:1232"),
+    )
+
+    adapter = factory.open()
+    try:
+        adapter.execute(intent)
+    finally:
+        adapter.close()
+
+    body = str(server.pull_requests[0]["body"])
+    assert len(body) <= 4000
+    assert "[truncated at 4000 characters]" in body
+    assert "Work-Item: #1232" in body
+    assert "Closes #1232" in body
+    assert ACCEPTANCE_LINE in body
+    assert body_carries_request_hash(body, intent.request.request_hash.value)
 
 
 @pytest.mark.parametrize(

@@ -55,7 +55,9 @@ def issue_work_item_order(session: Any, run_id: RunId) -> WorkItemOrderDocument:
             raise WorkItemOrderConflict("push requires one valid issue work-item order")
         orders.append(order)
     if len(orders) != 1:
-        raise WorkItemOrderConflict("push requires exactly one issue work-item order")
+        raise WorkItemOrderConflict(
+            "the run requires exactly one issue work-item order"
+        )
     return orders[0]
 
 

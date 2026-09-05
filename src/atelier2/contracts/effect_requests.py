@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 
 _SAFE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 _UNSAFE_BRANCH_FRAGMENTS = ("..", "@{", "//")
-_GITHUB_ISSUE_REFERENCE = re.compile(r"gh:([1-9][0-9]*)\Z")
 
 
 def _canonical_json(value: object) -> bytes:
@@ -113,15 +112,6 @@ def head_branch_for_queue_item(item_id: QueueItemIdentity) -> HeadBranch:
 
 def head_branch_for_unbound_request(payload: bytes) -> HeadBranch:
     return HeadBranch(f"atelier2-open-pr-{hashlib.sha256(payload).hexdigest()[:12]}")
-
-
-def github_issue_number(reference: TrackerItemReference) -> int:
-    """The positive GitHub issue number a GitHub tracker reference carries."""
-
-    match = _GITHUB_ISSUE_REFERENCE.fullmatch(reference.value)
-    if match is None:
-        raise ValueError("an open-pr work item reference names one GitHub issue")
-    return int(match.group(1))
 
 
 @dataclass(frozen=True, slots=True)
