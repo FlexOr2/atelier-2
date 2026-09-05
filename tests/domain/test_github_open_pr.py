@@ -26,6 +26,7 @@ from atelier2.contracts.effects import (
     LogicalEffectKey,
     ReadbackPhase,
 )
+from atelier2.contracts.queue_projection import TrackerItemReference
 from atelier2.contracts.runs import RunId, WorkflowRevision
 
 ADAPTER_REVISION = AdapterRevision("github-open-pr-v1")
@@ -114,6 +115,28 @@ def test_a_second_execute_finds_the_same_pull_request_and_does_not_create_a_twin
     assert read.confirmation_source is ConfirmationSource.ADAPTER_READBACK
     assert factory.recorded_pull_requests()[0].pr_number == 1
     assert len(factory.recorded_pull_requests()) == 1
+
+
+def test_an_open_pr_request_round_trips_its_typed_work_item_reference() -> None:
+    request = OpenPullRequest(
+        TREE.decode("utf-8"), HEAD_BRANCH, TrackerItemReference("gh:1232")
+    )
+
+    restored = OpenPullRequest.from_canonical_bytes(request.canonical_bytes())
+
+    assert restored == request
+
+
+def test_an_open_pr_request_without_a_work_item_reference_remains_readable() -> None:
+    legacy = json.dumps(
+        {"body": TREE.decode("utf-8"), "head_branch": HEAD_BRANCH.value},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    restored = OpenPullRequest.from_canonical_bytes(legacy)
+
+    assert restored == OpenPullRequest(TREE.decode("utf-8"), HEAD_BRANCH)
 
 
 @pytest.mark.parametrize("operation", ["readback", "execute"])
