@@ -52,7 +52,9 @@ def issue_work_item_order(session: Any, run_id: RunId) -> WorkItemOrderDocument:
             continue
         order = read_work_item_order_document(raw)
         if order is None or order.kind is not WorkItemKind.ISSUE:
-            raise WorkItemOrderConflict("push requires one valid issue work-item order")
+            raise WorkItemOrderConflict(
+                "the run requires one valid issue work-item order"
+            )
         orders.append(order)
     if len(orders) != 1:
         raise WorkItemOrderConflict(

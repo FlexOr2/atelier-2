@@ -158,7 +158,6 @@ def graph_action_intent(
     if operation.operation is AdapterOperationName.OPEN_PR:
         work_item = None
         if project_id is not None:
-            work_item = issue_work_item_order(session, run_id)
             head_branch = _confirmed_push_branch(
                 session,
                 run_id,
@@ -167,6 +166,7 @@ def graph_action_intent(
                 producing,
                 project_id,
             )
+            work_item = issue_work_item_order(session, run_id)
         else:
             head_branch = head_branch_for_unbound_request(payload)
         request = _open_pr_request(payload, head_branch, work_item, "Action")
